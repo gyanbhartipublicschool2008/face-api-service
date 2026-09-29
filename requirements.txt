@@ -1,5 +1,5 @@
 flask
 flask-cors
-opencv-python-headless
+Pillow
 numpy
 gunicorn
