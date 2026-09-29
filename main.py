@@ -1,108 +1,112 @@
 import base64
-import cv2
+import io
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import numpy as np
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
 
-# OpenCV Pre-trained Face Detector
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+
+def base64_to_image(b64_str):
+  if ',' in b64_str:
+    b64_str = b64_str.split(',')[1]
+  image_data = base64.b64decode(b64_str)
+  img = Image.open(io.BytesIO(image_data)).convert('L')  # Grayscale
+  return img
 
 
-def base64_to_cv2(b64_str):
-  if "," in b64_str:
-    b64_str = b64_str.split(",")[1]
-  data = base64.b64decode(b64_str)
-  arr = np.frombuffer(data, np.uint8)
-  return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+def is_valid_image(img):
+  arr = np.array(img)
+  # Standard deviation check: Diwal/plain background reject karne ke liye
+  std = np.std(arr)
+  if std < 18.0:
+    return False
+  return True
 
 
-def extract_face(img):
-  gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-  faces = face_cascade.detectMultiScale(
-      gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
-  )
-  if len(faces) == 0:
-    return None
-  # Sabse bada chehra lein
-  x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-  face_roi = gray[y : y + h, x : x + w]
-  face_resized = cv2.resize(face_roi, (150, 150))
-  # Histogram Equalization (Lighting effect normalize karne ke liye)
-  face_eq = cv2.equalizeHist(face_resized)
-  return face_eq
+def get_image_features(img):
+  # Standardized 128x128 face vector
+  resized = img.resize((128, 128))
+  arr = np.array(resized, dtype=np.float32)
+
+  # Normalize lighting
+  arr = (arr - np.mean(arr)) / (np.std(arr) + 1e-5)
+
+  # 1. Pixel spatial vector
+  spatial_vec = arr.flatten()
+
+  # 2. Histogram feature vector (64 bins)
+  hist, _ = np.histogram(arr, bins=64, range=(-3, 3), density=True)
+
+  return spatial_vec, hist
 
 
-@app.route("/compare", methods=["POST"])
+@app.route('/compare', methods=['POST'])
 def compare_faces():
   try:
     data = request.get_json()
-    master_b64 = data.get("masterPhoto")
-    live_b64 = data.get("livePhoto")
+    master_b64 = data.get('masterPhoto')
+    live_b64 = data.get('livePhoto')
 
     if not master_b64 or not live_b64:
       return jsonify(
-          {"matched": False, "message": "Photos missing", "similarity": 0}
+          {'matched': False, 'message': 'Photos missing', 'similarity': 0}
       )
 
-    master_img = base64_to_cv2(master_b64)
-    live_img = base64_to_cv2(live_b64)
+    master_img = base64_to_image(master_b64)
+    live_img = base64_to_image(live_b64)
 
-    master_face = extract_face(master_img)
-    if master_face is None:
+    # Blank / Plane wall rejection
+    if not is_valid_image(master_img):
       return jsonify({
-          "matched": False,
-          "message": "Master photo me chehra detect nahi hua!",
-          "similarity": 0,
+          'matched': False,
+          'message': 'Master photo me chehra theek se nahi dikha!',
+          'similarity': 0,
       })
 
-    live_face = extract_face(live_img)
-    if live_face is None:
+    if not is_valid_image(live_img):
       return jsonify({
-          "matched": False,
-          "message": (
-              "Live photo me koi chehra nahi mila! (Diwal/Object rejected)"
-          ),
-          "similarity": 0,
+          'matched': False,
+          'message': 'Diwal ya plane background detect hua! Chehra dikhayein.',
+          'similarity': 0,
       })
 
-    # 1. 2D Histogram Correlation Compare
-    hist1 = cv2.calcHist([master_face], [0], None, [256], [0, 256])
-    hist2 = cv2.calcHist([live_face], [0], None, [256], [0, 256])
-    cv2.normalize(hist1, hist1, 0, 1, cv2.NORM_MINMAX)
-    cv2.normalize(hist2, hist2, 0, 1, cv2.NORM_MINMAX)
-    hist_sim = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+    # Feature extraction
+    m_spatial, m_hist = get_image_features(master_img)
+    l_spatial, l_hist = get_image_features(live_img)
 
-    # 2. Template Matching Similarity
-    res = cv2.matchTemplate(master_face, live_face, cv2.TM_CCOEFF_NORMED)
-    _, max_val, _, _ = cv2.minMaxLoc(res)
+    # Cosine Similarity for spatial texture
+    spatial_sim = np.dot(m_spatial, l_spatial) / (
+        np.linalg.norm(m_spatial) * np.linalg.norm(l_spatial)
+    )
 
-    # Combined score
-    combined_score = (max(0, hist_sim) * 0.4) + (max(0, max_val) * 0.6)
-    similarity = round(float(combined_score * 100), 1)
+    # Histogram Correlation for tone/distribution
+    hist_sim = np.corrcoef(m_hist, l_hist)[0, 1]
 
-    # Threshold: Match ke liye 70% se zyada hona zaroori hai
+    # Weighted score (0 to 100)
+    score = (max(0, spatial_sim) * 0.6) + (max(0, hist_sim) * 0.4)
+    similarity = round(float(score * 100), 1)
+
+    # 70% threshold
     is_matched = bool(similarity >= 70.0)
 
     return jsonify({
-        "matched": is_matched,
-        "similarity": similarity,
-        "message": (
-            "Face Verified!"
+        'matched': is_matched,
+        'similarity': similarity,
+        'message': (
+            'Face Verified!'
             if is_matched
-            else "Face Mismatch! (Doosra insaan detect hua)"
+            else 'Face Mismatch! (Doosra insaan detect hua)'
         ),
     })
 
   except Exception as e:
     return jsonify(
-        {"matched": False, "message": "Server Error: " + str(e), "similarity": 0}
+        {'matched': False, 'message': 'Server Error: ' + str(e), 'similarity': 0}
     )
 
 
-if __name__ == "__main__":
-  app.run(host="0.0.0.0", port=5000)
+if __name__ == '__main__':
+  app.run(host='0.0.0.0', port=5000)
