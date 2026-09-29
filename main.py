@@ -1,60 +1,96 @@
 import base64
 import cv2
-import numpy as np
-import face_recognition
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
+import mediapipe as mp
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)
 
-def base64_to_cv2_img(b64_string):
-    if ',' in b64_string:
-        b64_string = b64_string.split(',')[1]
-    img_data = base64.b64decode(b64_string)
-    nparr = np.frombuffer(img_data, np.uint8)
-    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=True, max_num_faces=1, refine_landmarks=True
+)
+
+
+def base64_to_cv2(b64_str):
+  if ',' in b64_str:
+    b64_str = b64_str.split(',')[1]
+  data = base64.b64decode(b64_str)
+  arr = np.frombuffer(data, np.uint8)
+  return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def get_face_vector(img):
+  rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+  results = face_mesh.process(rgb)
+  if not results.multi_face_landmarks:
+    return None
+  landmarks = results.multi_face_landmarks[0].landmark
+  # 468 landmark coordinates (x, y, z)
+  vec = np.array([[lm.x, lm.y, lm.z] for lm in landmarks]).flatten()
+  return vec
+
 
 @app.route('/compare', methods=['POST'])
 def compare_faces():
+  try:
     data = request.get_json()
     master_b64 = data.get('masterPhoto')
     live_b64 = data.get('livePhoto')
 
     if not master_b64 or not live_b64:
-        return jsonify({"matched": False, "message": "Photos missing", "similarity": 0})
+      return jsonify(
+          {'matched': False, 'message': 'Photos missing', 'similarity': 0}
+      )
 
-    try:
-        master_img = base64_to_cv2_img(master_b64)
-        rgb_master = cv2.cvtColor(master_img, cv2.COLOR_BGR2RGB)
-        master_encodings = face_recognition.face_encodings(rgb_master)
+    master_img = base64_to_cv2(master_b64)
+    live_img = base64_to_cv2(live_b64)
 
-        if len(master_encodings) == 0:
-            return jsonify({"matched": False, "message": "Master photo me chehra detect nahi hua!", "similarity": 0})
+    master_vec = get_face_vector(master_img)
+    if master_vec is None:
+      return jsonify({
+          'matched': False,
+          'message': 'Master photo me chehra detect nahi hua!',
+          'similarity': 0,
+      })
 
-        live_img = base64_to_cv2_img(live_b64)
-        rgb_live = cv2.cvtColor(live_img, cv2.COLOR_BGR2RGB)
-        live_encodings = face_recognition.face_encodings(rgb_live)
+    live_vec = get_face_vector(live_img)
+    if live_vec is None:
+      # Diwal, pankha ya koi vastu aane par reject
+      return jsonify({
+          'matched': False,
+          'message': (
+              'Live photo me koi chehra nahi mila! (Diwal/Object rejected)'
+          ),
+          'similarity': 0,
+      })
 
-        if len(live_encodings) == 0:
-            return jsonify({"matched": False, "message": "Live photo me koi chehra nahi mila! (Diwal/Object rejected)", "similarity": 0})
+    # Cosine Similarity between face geometric landmarks
+    cos_sim = np.dot(master_vec, live_vec) / (
+        np.linalg.norm(master_vec) * np.linalg.norm(live_vec)
+    )
+    similarity = round(float(cos_sim) * 100, 1)
 
-        master_face = master_encodings[0]
-        live_face = live_encodings[0]
+    # Threshold: Chehra match hone ke liye 85% se upar zaroori hai
+    is_matched = bool(similarity >= 85.0)
 
-        face_dist = face_recognition.face_distance([master_face], live_face)[0]
-        similarity = round(max(0, (1.0 - face_dist)) * 100, 1)
+    return jsonify({
+        'matched': is_matched,
+        'similarity': similarity,
+        'message': (
+            'Face Verified!'
+            if is_matched
+            else 'Face Mismatch! (Doosra insaan detect hua)'
+        ),
+    })
 
-        is_matched = bool(face_dist <= 0.45)
+  except Exception as e:
+    return jsonify(
+        {'matched': False, 'message': 'Server Error: ' + str(e), 'similarity': 0}
+    )
 
-        return jsonify({
-            "matched": is_matched,
-            "similarity": similarity,
-            "message": "Face Verified!" if is_matched else "Face Mismatch! (Doosra insaan detect hua)"
-        })
-
-    except Exception as e:
-        return jsonify({"matched": False, "message": "Server Error: " + str(e), "similarity": 0})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+  app.run(host='0.0.0.0', port=5000)
