@@ -1,6 +1,6 @@
 flask
 flask-cors
-face-recognition
+mediapipe
 opencv-python-headless
-gunicorn
 numpy
+gunicorn
